@@ -18,6 +18,103 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+
     steps:
-      - name: 测试
-        run: echo "工作流显示正常"
+      - name: 选择 Token
+        id: select_token
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TOKEN_NUM="${{ github.event.inputs.token_number }}"
+          else
+            TOKEN_NUM=1
+          fi
+          echo "token_number=$TOKEN_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装环境
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+          sudo apt-get update
+          sudo apt-get install -y jq bc net-tools
+
+      # 这里仅做示例，实际代理设置先跳过，直接运行续期脚本（直连）
+      - name: 设置 Discord Token
+        run: |
+          TOKEN_NUM="${{ steps.select_token.outputs.token_number }}"
+          case "$TOKEN_NUM" in
+            1) echo "DISCORD_TOKEN=${{ secrets.FREEZEHOST_DISCORD_TOKEN_1 }}" >> "$GITHUB_ENV" ;;
+            2) echo "DISCORD_TOKEN=${{ secrets.FREEZEHOST_DISCORD_TOKEN_2 }}" >> "$GITHUB_ENV" ;;
+            3) echo "DISCORD_TOKEN=${{ secrets.FREEZEHOST_DISCORD_TOKEN_3 }}" >> "$GITHUB_ENV" ;;
+            4) echo "DISCORD_TOKEN=${{ secrets.FREEZEHOST_DISCORD_TOKEN_4 }}" >> "$GITHUB_ENV" ;;
+            5) echo "DISCORD_TOKEN=${{ secrets.FREEZEHOST_DISCORD_TOKEN_5 }}" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: 运行续期（直连，无代理）
+        env:
+          FREEZEHOST_DISCORD_TOKEN: ${{ env.DISCORD_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python renew.py 2>&1 | tee renew.log
+
+      - name: 提取剩余天数（简版）
+        id: extract_days
+        if: always()
+        run: |
+          MIN_DAYS=""
+          if [ -f "renew_result.json" ]; then
+            MIN_DAYS=$(jq -r '.min_remaining_days // empty' renew_result.json)
+          fi
+          if [ -z "$MIN_DAYS" ] && [ -f "renew.log" ]; then
+            MIN_DAYS=$(grep -oP '剩余\s*[\d.]+' renew.log | grep -oP '[\d.]+' | sort -n | head -1 || echo "0.5")
+          fi
+          if [ -z "$MIN_DAYS" ]; then MIN_DAYS="0.5"; fi
+          echo "remaining_days=$MIN_DAYS" >> "$GITHUB_OUTPUT"
+          echo "剩余天数: $MIN_DAYS"
+
+      - name: 更新 Cron（占位）
+        if: success()
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          token: ${{ secrets.REPO_TOKEN }}
+          path: workflow_repo
+          fetch-depth: 1
+
+      - name: 修改 Cron（简化）
+        if: success()
+        run: |
+          cd workflow_repo
+          NEW_CRON="0 0 * * *"   # 临时
+          sed -i "s/- cron: .*/- cron: '$NEW_CRON'/" .github/workflows/FreezeHost_Renew.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/FreezeHost_Renew.yml
+          git commit -m "更新 Cron" || exit 0
+          git remote set-url origin "https://x-access-token:${{ secrets.REPO_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push || exit 0
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+          retention-days: 7
+
+      - name: 清理历史
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 30
+          keep_minimum_runs: 5
