@@ -16,6 +16,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 DISCORD_TOKEN = os.environ.get("FREEZEHOST_DISCORD_TOKEN", "").strip()
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "").strip()
+PROXY_URL     = os.environ.get("PROXY_URL", "").strip()   # 例如 socks5://127.0.0.1:1080
 
 TIMEOUT        = 60_000
 MAX_SITE_RETRIES = 3
@@ -47,6 +48,8 @@ def _mask(text: str) -> str:
         text = text.replace(TG_BOT_TOKEN, "***")
     if TG_CHAT_ID:
         text = text.replace(TG_CHAT_ID, "***")
+    if PROXY_URL:
+        text = text.replace(PROXY_URL, "***")
     for val in _SENSITIVE_VALUES:
         if val in text:
             text = text.replace(val, "***")
@@ -65,12 +68,10 @@ def parse_remaining(text: str) -> str | None:
     """将剩余时间文本（如 '1.5 days and 2.3 hours'）解析为 'X天X时X分' 格式"""
     if not text:
         return None
-    # 匹配数字（带小数）
     d = re.search(r"(\d+(?:\.\d+)?)\s*day", text, re.I)
     h = re.search(r"(\d+(?:\.\d+)?)\s*hour", text, re.I)
     days_raw  = float(d.group(1)) if d else 0.0
     hours_raw = float(h.group(1)) if h else 0.0
-    # 统一按小时计算
     total_hours = days_raw * 24 + hours_raw
     if total_hours <= 0:
         return None
@@ -235,13 +236,11 @@ def wait_for_site_ready(page) -> bool:
 
         page.wait_for_timeout(3000)
 
-        # 检查是否因代理被阻止
         if check_site_blocked(page):
             log_error("检测到页面提示 VPN/代理被阻止，无法继续")
             take_screenshot(page, f"site-blocked-{attempt}")
             return False
 
-        # 检测是否宕机页面
         if check_site_down(page):
             log_warn(f"FreezeHost 后端服务不可用 (尝试 {attempt})")
             take_screenshot(page, f"site-down-{attempt}")
@@ -266,7 +265,6 @@ def wait_for_site_ready(page) -> bool:
                     page.wait_for_timeout(RETRY_WAIT)
                 continue
 
-        # 确认登录按钮可见（关键修复）
         try:
             login_btn = page.locator('span.text-lg:has-text("Login with Discord")')
             login_btn.wait_for(state="visible", timeout=10000)
@@ -288,7 +286,6 @@ def handle_oauth_page(page):
     for _ in range(20):
         if "discord.com" not in page.url:
             return
-        # 尝试滚动到底部，使授权按钮可见
         page.evaluate("""() => {
             const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
                 '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
@@ -312,9 +309,7 @@ def handle_oauth_page(page):
         }""")
         page.wait_for_timeout(800)
 
-        # 尝试点击授权按钮（等待启用）
         try:
-            # 优先使用 enabled 状态
             auth_btn = page.locator('button:has-text("Authorize"):enabled, button:has-text("授权"):enabled')
             if auth_btn.is_visible():
                 auth_btn.click()
@@ -325,7 +320,6 @@ def handle_oauth_page(page):
         except:
             pass
 
-        # 备选：点击最底部的按钮
         try:
             btn = page.locator('div[class*="footer"] button').last
             if btn.is_visible() and btn.is_enabled():
@@ -425,7 +419,6 @@ def process_server(page, server_id: str) -> dict:
         }""")
 
         if not (renew_href and renew_href.get("href")):
-            # 尝试点击外链图标
             page.evaluate("""() => {
                 const icon = document.querySelector('i.fa-external-link-alt');
                 if (icon) { (icon.closest('button') || icon.parentElement || icon).click(); return; }
@@ -469,7 +462,6 @@ def process_server(page, server_id: str) -> dict:
                     return el ? el.innerText.trim() : null;
                 }""")
                 result["after"] = parse_remaining(after_text)
-                # 更新剩余天数
                 new_days = remaining_total_days(after_text)
                 if new_days is not None:
                     result["remaining_days"] = new_days
@@ -493,14 +485,19 @@ def process_server(page, server_id: str) -> dict:
 
     return result
 
-#  主流程
 def run():
     if not DISCORD_TOKEN:
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
 
-    log_info("启动浏览器 (直连，不使用代理)")
+    log_info("启动浏览器" + (" (使用代理)" if PROXY_URL else " (直连)"))
+
+    launch_options = {"headless": True}
+    if PROXY_URL:
+        launch_options["proxy"] = {"server": PROXY_URL}
+        log_info(f"代理地址: {PROXY_URL}")
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(**launch_options)
         page = browser.new_page(viewport={"width": VIEWPORT_W, "height": VIEWPORT_H})
         page.set_default_timeout(TIMEOUT)
         log_info("浏览器就绪")
@@ -532,10 +529,9 @@ def run():
                 )
                 send_tg(msg, buf)
                 log_warn("站点不可用，本次跳过续期")
-                return   # Exit gracefully — not a script error
+                return
 
             # ── 登录 ─────────────────────────────────────
-            # 使用备用选择器提高兼容性
             login_selectors = [
                 'span.text-lg:has-text("Login with Discord")',
                 'button:has-text("Login with Discord")',
@@ -613,7 +609,7 @@ def run():
 
             log_info("登录成功")
 
-            # ── 邮箱（唯一显示名） ───────────────────────
+            # ── 邮箱 ───────────────────────────────────────
             email = extract_email(page)
             if email:
                 display_name = email
@@ -649,14 +645,13 @@ def run():
                 if r["detail"]:
                     s += f" {r['detail']}"
                 lines.append(s)
-                # 收集剩余天数（取最小值）
                 if r.get("remaining_days") is not None:
                     if min_days is None or r["remaining_days"] < min_days:
                         min_days = r["remaining_days"]
 
             send_tg("\n".join([f"用户：{display_name}", *lines, "", "FreezeHost Auto Renew"]), final_img)
 
-            # ── 写入 JSON 供 Workflow 使用 ──────────────
+            # ── 写入 JSON ──────────────────────────────────
             with open("renew_result.json", "w") as f:
                 json.dump({
                     "min_remaining_days": min_days,
