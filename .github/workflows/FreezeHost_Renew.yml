@@ -81,6 +81,7 @@ jobs:
           echo "📝 解析节点链接..."
           VLESS=$(echo "${NODE_LINK}" | tr -d ' \n\r\t')
           CONVERTED=false
+
           # 尝试直接转换
           if echo "$VLESS" | /usr/local/bin/sing-box convert link - > /tmp/outbound.json 2>/dev/null; then
             if [ -s /tmp/outbound.json ]; then
@@ -89,8 +90,9 @@ jobs:
             fi
           fi
 
-          if [ "$CONVERTED" = false ]; then
-            echo "⚠️ 直接转换失败，尝试作为订阅下载..."
+          # 如果直接转换失败，且链接是 http/https，尝试作为订阅
+          if [ "$CONVERTED" = false ] && [[ "$VLESS" =~ ^https?:// ]]; then
+            echo "⚠️ 尝试作为订阅下载..."
             if curl -L -o /tmp/sub.txt "$VLESS" --connect-timeout 10 --max-time 30; then
               FIRST_LINE=$(grep -v '^$' /tmp/sub.txt | head -n1)
               if [ -n "$FIRST_LINE" ]; then
@@ -104,83 +106,84 @@ jobs:
             fi
           fi
 
-          if [ "$CONVERTED" = false ]; then
+          # 如果还不成功，尝试 Python 解析 vless
+          if [ "$CONVERTED" = false ] && [[ "$VLESS" =~ ^vless:// ]]; then
             echo "⚠️ 尝试 Python 解析 vless 链接..."
-            # 写入 Python 脚本到临时文件，然后执行（避免 heredoc）
+            # 直接将 Python 脚本写入文件（不用 heredoc，避免缩进问题）
             cat > /tmp/parse_vless.py << 'EOF'
-            import json, sys, os, re
-            from urllib.parse import urlparse, parse_qs
+import json, sys, os, re
+from urllib.parse import urlparse, parse_qs
 
-            link = os.environ.get('VLESS', '')
-            if not link:
-                sys.exit(1)
-            if not link.startswith('vless://'):
-                sys.exit(1)
-            parsed = urlparse(link)
-            if parsed.scheme != 'vless':
-                sys.exit(1)
+link = os.environ.get('VLESS', '')
+if not link:
+    sys.exit(1)
+if not link.startswith('vless://'):
+    sys.exit(1)
+parsed = urlparse(link)
+if parsed.scheme != 'vless':
+    sys.exit(1)
 
-            netloc = parsed.netloc
-            if '@' in netloc:
-                uuid, host_port = netloc.split('@', 1)
-            else:
-                uuid, host_port = '', netloc
+netloc = parsed.netloc
+if '@' in netloc:
+    uuid, host_port = netloc.split('@', 1)
+else:
+    uuid, host_port = '', netloc
 
-            host = ''
-            port = '443'
-            bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
-            if bracket_match:
-                host = bracket_match.group(1)
-                if bracket_match.group(2):
-                    port = bracket_match.group(2)
-            else:
-                if host_port.count(':') > 1:
-                    host = host_port
-                else:
-                    if ':' in host_port:
-                        host, port = host_port.split(':', 1)
-                    else:
-                        host = host_port
-            if not host:
-                sys.exit(1)
+host = ''
+port = '443'
+bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+if bracket_match:
+    host = bracket_match.group(1)
+    if bracket_match.group(2):
+        port = bracket_match.group(2)
+else:
+    if host_port.count(':') > 1:
+        host = host_port
+    else:
+        if ':' in host_port:
+            host, port = host_port.split(':', 1)
+        else:
+            host = host_port
+if not host:
+    sys.exit(1)
 
-            params = parse_qs(parsed.query)
-            sni = params.get('sni', [''])[0] or host
-            fp = params.get('fp', [''])[0] or 'chrome'
-            flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
-            type_ = params.get('type', ['tcp'])[0]
-            security = params.get('security', [''])[0]
+params = parse_qs(parsed.query)
+sni = params.get('sni', [''])[0] or host
+fp = params.get('fp', [''])[0] or 'chrome'
+flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
+type_ = params.get('type', ['tcp'])[0]
+security = params.get('security', [''])[0]
 
-            outbound = {
-                "type": "vless",
-                "tag": "vless-out",
-                "server": host,
-                "server_port": int(port),
-                "uuid": uuid,
-                "flow": flow,
-                "tls": {
-                    "enabled": True,
-                    "server_name": sni,
-                    "insecure": False,
-                    "utls": {"enabled": True, "fingerprint": fp}
-                },
-                "packet_encoding": "packetaddr"
-            }
-            if type_ != 'tcp':
-                outbound["transport"] = {"type": type_}
-            if security == 'reality':
-                pbk = params.get('pbk', [''])[0]
-                sid = params.get('sid', [''])[0]
-                outbound['tls']['reality'] = {"enabled": True, "public_key": pbk, "short_id": sid}
+outbound = {
+    "type": "vless",
+    "tag": "vless-out",
+    "server": host,
+    "server_port": int(port),
+    "uuid": uuid,
+    "flow": flow,
+    "tls": {
+        "enabled": True,
+        "server_name": sni,
+        "insecure": False,
+        "utls": {"enabled": True, "fingerprint": fp}
+    },
+    "packet_encoding": "packetaddr"
+}
+if type_ != 'tcp':
+    outbound["transport"] = {"type": type_}
+if security == 'reality':
+    pbk = params.get('pbk', [''])[0]
+    sid = params.get('sid', [''])[0]
+    outbound['tls']['reality'] = {"enabled": True, "public_key": pbk, "short_id": sid}
 
-            config = {
-                "log": {"level": "warn"},
-                "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080}],
-                "outbounds": [outbound],
-                "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
-            }
-            json.dump(config, sys.stdout, indent=2)
-            EOF
+config = {
+    "log": {"level": "warn"},
+    "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080}],
+    "outbounds": [outbound],
+    "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
+}
+json.dump(config, sys.stdout, indent=2)
+EOF
             export VLESS
             if python3 /tmp/parse_vless.py > sing-box-config.json 2>/dev/null; then
               if [ -s sing-box-config.json ]; then
