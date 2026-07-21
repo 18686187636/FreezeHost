@@ -80,7 +80,7 @@ def main():
         print("未设置 VLESS 环境变量", file=sys.stderr)
         sys.exit(1)
 
-    # 先尝试 sing-box convert（如果存在）
+    # 先尝试 sing-box convert（输出已经是数组）
     try:
         proc = subprocess.run(
             ['sing-box', 'convert', 'link'],
@@ -89,10 +89,9 @@ def main():
             timeout=10
         )
         if proc.returncode == 0:
-            outbound = json.loads(proc.stdout)
-            if outbound:
-                json.dump(outbound, sys.stdout, indent=2)
-                return
+            # 直接输出（已经是数组）
+            sys.stdout.write(proc.stdout.decode())
+            return
         else:
             # 打印 stderr 以便调试
             print(f"sing-box convert stderr: {proc.stderr.decode()}", file=sys.stderr)
@@ -102,7 +101,8 @@ def main():
     # 回退到手动 vless 解析
     outbound = parse_vless(link)
     if outbound:
-        json.dump(outbound, sys.stdout, indent=2)
+        # 输出为数组（包装在 [] 中）
+        json.dump([outbound], sys.stdout, indent=2)
         return
 
     print("解析失败", file=sys.stderr)
