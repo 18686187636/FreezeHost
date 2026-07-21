@@ -65,7 +65,6 @@ def log_warn(msg: str):  print(f"[WARN] {_mask(msg)}")
 def log_error(msg: str): print(f"[ERROR] {_mask(msg)}")
 
 def parse_remaining(text: str) -> str | None:
-    """将剩余时间文本（如 '1.5 days and 2.3 hours'）解析为 'X天X时X分' 格式"""
     if not text:
         return None
     d = re.search(r"(\d+(?:\.\d+)?)\s*day", text, re.I)
@@ -199,7 +198,6 @@ def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
         pg.close()
 
 def check_site_down(page) -> bool:
-    """Detect FreezeHost 'CONNECTION TO THE MANAGEMENT SERVICES LOST' or similar outage screens."""
     try:
         return page.evaluate("""() => {
             const body = document.body ? document.body.innerText : '';
@@ -212,7 +210,6 @@ def check_site_down(page) -> bool:
         return False
 
 def check_site_blocked(page) -> bool:
-    """检测是否因代理/VPN被阻止"""
     try:
         body = page.content()
         if "VPN" in body or "代理" in body or "proxy" in body.lower():
@@ -223,7 +220,6 @@ def check_site_blocked(page) -> bool:
         return False
 
 def wait_for_site_ready(page) -> bool:
-    """尝试加载 FreezeHost，直到登录按钮可见或达到最大重试次数"""
     for attempt in range(1, MAX_SITE_RETRIES + 1):
         log_info(f"加载 FreezeHost 首页 (尝试 {attempt}/{MAX_SITE_RETRIES})...")
         try:
@@ -280,57 +276,80 @@ def wait_for_site_ready(page) -> bool:
     return False
 
 def handle_oauth_page(page):
+    """改进的 OAuth 授权处理，使用可靠的选择器并等待导航"""
     log_info("进入 OAuth 授权页处理")
-    page.wait_for_timeout(2000)
-
-    for _ in range(20):
-        if "discord.com" not in page.url:
-            return
-        page.evaluate("""() => {
-            const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
-                '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
-                'div[class*="modal"] div[style*="overflow"]','div[class*="root"] div[style*="overflow"]'];
-            let scrolled = false;
-            for (const sel of sels) {
-                for (const el of document.querySelectorAll(sel)) {
-                    const s = getComputedStyle(el);
-                    if (el.scrollHeight > el.clientHeight &&
-                        ['auto','scroll'].some(v => s.overflowY === v || s.overflow === v))
-                        { el.scrollTop = el.scrollHeight; scrolled = true; }
-                }
-            }
-            if (!scrolled) document.querySelectorAll('div').forEach(el => {
-                if (el.scrollHeight > el.clientHeight + 10) {
-                    const s = getComputedStyle(el);
-                    if (['auto','scroll','hidden'].includes(s.overflowY)) el.scrollTop = el.scrollHeight;
-                }
-            });
-            scrollTo(0, document.body.scrollHeight);
-        }""")
-        page.wait_for_timeout(800)
-
+    
+    # 等待授权页面完全加载
+    try:
+        page.wait_for_selector('button[type="submit"]', timeout=10000)
+    except:
+        pass
+    
+    # 尝试滚动到底部，确保授权按钮可见
+    for _ in range(5):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(500)
+    
+    # 定义多种可能的选择器，按优先级尝试
+    auth_selectors = [
+        'button[type="submit"]:has-text("Authorize")',
+        'button[type="submit"]:has-text("授权")',
+        'div[class*="footer"] button:has-text("Authorize")',
+        'div[class*="footer"] button:has-text("授权")',
+        'button:has-text("Authorize")',
+        'button:has-text("授权")',
+    ]
+    
+    # 尝试点击授权按钮并等待导航
+    for selector in auth_selectors:
         try:
-            auth_btn = page.locator('button:has-text("Authorize"):enabled, button:has-text("授权"):enabled')
-            if auth_btn.is_visible():
-                auth_btn.click()
-                page.wait_for_timeout(2000)
-                if "discord.com" not in page.url:
-                    return
-                continue
-        except:
-            pass
-
-        try:
-            btn = page.locator('div[class*="footer"] button').last
+            btn = page.locator(selector)
             if btn.is_visible() and btn.is_enabled():
-                btn.click()
-                page.wait_for_timeout(2000)
-                if "discord.com" not in page.url:
-                    return
-        except:
-            pass
-
-        page.wait_for_timeout(1500)
+                log_info(f"尝试点击授权按钮: {selector}")
+                # 使用 click 并等待导航
+                with page.expect_navigation(timeout=20000):
+                    btn.click()
+                log_info("授权按钮点击成功，页面已跳转")
+                return
+        except Exception as e:
+            log_warn(f"选择器 {selector} 点击失败: {e}")
+            continue
+    
+    # 如果上述都失败，尝试使用更通用的方法：点击第一个可见的授权按钮
+    try:
+        # 查找所有包含 "Authorize" 或 "授权" 的按钮
+        btns = page.locator('button:has-text("Authorize"), button:has-text("授权")')
+        if btns.count() > 0:
+            # 取最后一个（通常是最底部的）
+            btn = btns.last
+            if btn.is_visible() and btn.is_enabled():
+                log_info("使用通用选择器点击授权按钮")
+                with page.expect_navigation(timeout=20000):
+                    btn.click()
+                return
+    except Exception as e:
+        log_warn(f"通用点击失败: {e}")
+    
+    # 如果还是失败，尝试强制点击（使用 evaluate）
+    try:
+        log_info("尝试使用 JavaScript 强制点击授权按钮")
+        page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button'));
+            const target = btns.find(b => 
+                b.textContent.toLowerCase().includes('authorize') || 
+                b.textContent.toLowerCase().includes('授权')
+            );
+            if (target) target.click();
+        }""")
+        page.wait_for_timeout(3000)
+        # 检查是否已跳转
+        if "free.freezehost.pro" in page.url:
+            log_info("强制点击后已跳转")
+            return
+    except Exception as e:
+        log_warn(f"强制点击失败: {e}")
+    
+    raise RuntimeError("OAuth 授权按钮点击失败，无法继续")
 
 def discover_server_ids(page) -> list[str]:
     for attempt in range(3):
@@ -582,16 +601,18 @@ def run():
 
             # ── OAuth ─────────────────────────────────────
             try:
-                page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
+                # 等待 OAuth 授权页
+                page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=10000)
                 page.wait_for_timeout(2000)
                 if "discord.com" in page.url:
+                    # 处理 OAuth 授权
                     handle_oauth_page(page)
-                if "discord.com" in page.url:
-                    try:
-                        page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=20000)
-                    except PlaywrightTimeout:
-                        take_screenshot(page, "oauth-stuck")
-                        raise RuntimeError("OAuth 未跳转")
+                # 等待跳转回 FreezeHost
+                try:
+                    page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=25000)
+                except PlaywrightTimeout:
+                    take_screenshot(page, "oauth-stuck")
+                    raise RuntimeError("OAuth 授权后未跳转回 FreezeHost")
             except PlaywrightTimeout:
                 if "discord.com" in page.url:
                     raise RuntimeError("OAuth 超时")
