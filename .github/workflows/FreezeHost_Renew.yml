@@ -67,33 +67,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq bc
 
-      - name: 启用 WARP 网络
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
-
-      - name: 修复 DNS
-        run: |
-          echo "[INFO] 停用 systemd-resolved，直连 DNS..."
-
-          sudo systemctl stop systemd-resolved 2>/dev/null || true
-          sudo systemctl disable systemd-resolved 2>/dev/null || true
-
-          sudo rm -f /etc/resolv.conf
-          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
-
-          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
-          sleep 2
-
-          echo "[INFO] DNS 测试:"
-          nslookup free.freezehost.pro 1.1.1.1 || echo "[WARN] 解析失败"
-
-          echo ""
-          echo "[INFO] 当前出口 IP:"
-          curl -s --max-time 10 https://api.ipify.org && echo
-          echo "[INFO] WARP Trace:"
-          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+      # 移除 WARP 代理，改为直连（避免被检测为 VPN）
+      # - name: 启用 WARP 网络
+      #   uses: fscarmen/warp-on-actions@v1.3
+      #   with:
+      #     stack: dual
+      #     mode: client
 
       - name: 设置 Discord Token
         run: |
@@ -120,15 +99,15 @@ jobs:
           echo "使用 Token 编号: ${{ steps.select_token.outputs.token_number }}"
           python renew.py 2>&1 | tee renew.log
 
-      - name: 提取剩余天数（取所有服务器的最小值）
+      - name: 提取剩余天数（从 JSON 或日志）
         id: extract_days
-        if: success()
+        if: always()  # 即使脚本失败也尝试提取，以便更新 Cron
         run: |
           set -e
           
           MIN_DAYS=""
           
-          # 优先从 renew_result.json 读取（若存在）
+          # 优先从 renew_result.json 读取
           if [ -f "renew_result.json" ]; then
             MIN_DAYS=$(jq -r '.min_remaining_days // empty' renew_result.json)
             if [ -n "$MIN_DAYS" ]; then
@@ -136,14 +115,19 @@ jobs:
             fi
           fi
           
-          # 其次从 renew.log 提取所有剩余天数，取最小值
+          # 若 JSON 无数据，从日志正则提取（兼容旧版本）
           if [ -z "$MIN_DAYS" ] && [ -f "renew.log" ]; then
             echo "📋 从 renew.log 提取所有服务器剩余天数："
-            
-            MIN_DAYS=""
+            # 匹配 "续期状态: X days and Y hours remaining" 或类似
             while IFS= read -r line; do
-              DAYS=$(echo "$line" | grep -oP '\d+(?=\s*DAYS?)' || echo "0")
-              HOURS=$(echo "$line" | grep -oP '\d+\.?\d*(?=\s*HOURS?)' || echo "0")
+              # 先尝试标准格式
+              DAYS=$(echo "$line" | grep -oP '(\d+(?:\.\d+)?)\s*(?=days? and)' || echo "0")
+              HOURS=$(echo "$line" | grep -oP '(\d+(?:\.\d+)?)\s*(?=hours? remaining)' || echo "0")
+              
+              if [ "$DAYS" = "0" ] && [ "$HOURS" = "0" ]; then
+                # 尝试其他格式（可能只有天）
+                DAYS=$(echo "$line" | grep -oP '(\d+(?:\.\d+)?)\s*(?=days? remaining)' || echo "0")
+              fi
               
               if [ "$DAYS" != "0" ] || [ "$HOURS" != "0" ]; then
                 TOTAL=$(echo "scale=6; $DAYS + ($HOURS / 24)" | bc)
@@ -153,28 +137,29 @@ jobs:
                   MIN_DAYS="$TOTAL"
                 fi
               fi
-            done < <(grep -E "续期状态: .* DAYS? AND .* HOURS? REMAINING" renew.log || true)
+            done < <(grep -E "续期状态:" renew.log || true)
             
             if [ -n "$MIN_DAYS" ]; then
-              echo "✅ 最小剩余天数: $MIN_DAYS"
+              echo "✅ 最小剩余天数（日志提取）: $MIN_DAYS"
             fi
           fi
           
-          # 如果都没找到，退出
+          # 如果仍未找到，设置默认值 0.5 天（12 小时后重试）
           if [ -z "$MIN_DAYS" ] || [ "$MIN_DAYS" = "0" ]; then
-            echo "::warning::未找到有效的剩余时间，跳过 workflow 更新"
-            echo "skip_update=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::warning::未找到有效剩余时间，设为默认 0.5 天（12 小时后重试）"
+            MIN_DAYS="0.5"
+            echo "skip_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_update=false" >> "$GITHUB_OUTPUT"
           fi
           
           echo "remaining_days=$MIN_DAYS" >> "$GITHUB_OUTPUT"
-          echo "skip_update=false" >> "$GITHUB_OUTPUT"
           echo "::notice::剩余天数（最小值）: $MIN_DAYS"
           
           mkdir -p /tmp/renew_data
           echo "$MIN_DAYS" > /tmp/renew_data/remaining_days.txt
 
-      - name: 拉取仓库
+      - name: 拉取仓库（用于更新）
         if: success() && steps.extract_days.outputs.skip_update != 'true'
         uses: actions/checkout@v4
         with:
@@ -188,7 +173,6 @@ jobs:
         run: |
           set -e
 
-          # 读取剩余天数（优先 output，其次临时文件）
           REMAINING_DAYS="${{ steps.extract_days.outputs.remaining_days }}"
           
           if [ -z "$REMAINING_DAYS" ] && [ -f "/tmp/renew_data/remaining_days.txt" ]; then
@@ -200,7 +184,7 @@ jobs:
           echo "剩余天数: $REMAINING_DAYS"
           echo "Token 编号: $TOKEN_NUM"
 
-          # 计算下次运行时间（到期前 2 天）
+          # 计算下次运行时间（到期前 2 天，但最小为 0.5 天）
           if (( $(echo "$REMAINING_DAYS > 2" | bc -l) )); then
             DAYS_UNTIL_NEXT_RUN=$(echo "$REMAINING_DAYS - 2" | bc)
           else
@@ -208,12 +192,17 @@ jobs:
             echo "::warning::剩余时间不足 2 天，12 小时后重试"
           fi
 
-          DAYS_INT=$(printf "%.0f" "$DAYS_UNTIL_NEXT_RUN")
+          # 取整为至少 1 天（避免当天重复触发）
+          DAYS_INT=$(echo "scale=0; $DAYS_UNTIL_NEXT_RUN / 1" | bc)
+          if (( $(echo "$DAYS_INT < 1" | bc -l) )); then
+            DAYS_INT=1
+          fi
+
           NEXT_DATE=$(date -u -d "+${DAYS_INT} days" +"%Y-%m-%d %H:%M")
           NEXT_DAY=$(date -u -d "+${DAYS_INT} days" +"%-d")
           NEXT_MONTH=$(date -u -d "+${DAYS_INT} days" +"%-m")
           
-          # 根据 Token 编号设置不同的小时（保持 01~05 UTC，避免冲突）
+          # 根据 Token 编号设置不同的小时（保持 01~05 UTC）
           case "$TOKEN_NUM" in
             1) NEXT_HOUR=1 ;;
             2) NEXT_HOUR=2 ;;
@@ -230,10 +219,8 @@ jobs:
           echo "::notice::📅 下次运行: $NEXT_DATE UTC"
           echo "::notice::⏰ 新 Cron: $NEW_CRON"
 
-          # 切换到 workflow_repo 目录
           cd workflow_repo
 
-          # 从 github.workflow_ref 提取当前 workflow 文件路径
           WORKFLOW_FILE=$(echo "${{ github.workflow_ref }}" | sed -E 's|^[^/]+/[^/]+/(\.github/workflows/[^@]+)@.*|\1|')
 
           echo "::notice::📄 当前 workflow 文件: $WORKFLOW_FILE"
@@ -246,9 +233,9 @@ jobs:
             exit 1
           fi
 
-          # 查找对应 Token 的 cron 行
+          # 精确匹配对应 Token 的 cron 行（避免误改注释）
           TARGET_PATTERN="FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM"
-          LINE_NUM=$(grep -n "$TARGET_PATTERN" "$WORKFLOW_FILE" | cut -d: -f1 | head -n1)
+          LINE_NUM=$(grep -n "cron:.*$TARGET_PATTERN" "$WORKFLOW_FILE" | cut -d: -f1 | head -n1)
 
           if [ -z "$LINE_NUM" ]; then
             echo "::error::找不到 $TARGET_PATTERN 对应行"
@@ -259,34 +246,18 @@ jobs:
           fi
 
           echo "::notice::更新第 $LINE_NUM 行"
+          sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'   # $TARGET_PATTERN - 下一次: $NEXT_DATE UTC" "$WORKFLOW_FILE"
 
-          echo "::group::原始行"
-          sed -n "${LINE_NUM}p" "$WORKFLOW_FILE"
-          echo "::endgroup::"
-
-          # 替换指定行
-          sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'   # FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM - 下一次: $NEXT_DATE UTC" "$WORKFLOW_FILE"
-
-          echo "::group::修改后"
-          sed -n "${LINE_NUM}p" "$WORKFLOW_FILE"
-          echo "::endgroup::"
-
-          # 检查是否有变化
           if git diff --quiet "$WORKFLOW_FILE"; then
             echo "::notice::没有变化需要提交"
             exit 0
           fi
 
-          echo "::group::完整修改内容"
-          git diff "$WORKFLOW_FILE"
-          echo "::endgroup::"
-
-          # 提交并推送
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$WORKFLOW_FILE"
           
-          git commit -m "自动调整 FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM 下次续期时间" \
+          git commit -m "自动调整 $TARGET_PATTERN 下次续期时间" \
                      -m "下次运行: $NEXT_DATE UTC" \
                      -m "Cron: $NEW_CRON" \
                      -m "剩余天数（最小值）: $REMAINING_DAYS"
@@ -296,20 +267,20 @@ jobs:
 
           echo "::notice::✅ 成功更新 workflow 文件"
 
-#      - name: 上传截图
-#        if: always()
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: renew-screenshots-token-${{ steps.select_token.outputs.token_number }}
-#          path: screenshots/
-#          retention-days: 7
+      - name: 上传截图（调试用，可选）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-screenshots-token-${{ steps.select_token.outputs.token_number }}
+          path: screenshots/
+          retention-days: 7
 
-      - name: 清理历史运行记录
+      - name: 清理历史运行记录（保留最近 5 次）
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
           delete_workflow_pattern: ${{ github.workflow }}
-          retain_days: 0
-          keep_minimum_runs: 1
+          retain_days: 30
+          keep_minimum_runs: 5
