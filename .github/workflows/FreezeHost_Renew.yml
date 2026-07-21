@@ -85,7 +85,6 @@ jobs:
           chmod +x /usr/local/bin/sing-box
 
           echo "➜ 解析节点链接并生成配置..."
-          # 尝试直接转换链接
           echo "$NODE_LINK" | /usr/local/bin/sing-box convert link - > /tmp/outbound.json 2>/dev/null || true
 
           if [ -s /tmp/outbound.json ]; then
@@ -129,7 +128,6 @@ jobs:
 
           echo "➜ 启动 sing-box 代理（后台运行）..."
           /usr/local/bin/sing-box run -c config.json &
-          # 等待端口监听（最多 10 秒）
           for i in {1..10}; do
             if netstat -tulpn 2>/dev/null | grep -q ":1080.*LISTEN"; then
               echo "✅ 代理已启动，监听 1080 端口"
@@ -162,7 +160,7 @@ jobs:
           FREEZEHOST_DISCORD_TOKEN: ${{ env.DISCORD_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL: ${{ env.PROXY_URL }}   # 由上一步注入
+          PROXY_URL: ${{ env.PROXY_URL }}
         run: |
           echo "使用 Token 编号: ${{ steps.select_token.outputs.token_number }}"
           python renew.py 2>&1 | tee renew.log
