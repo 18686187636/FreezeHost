@@ -87,7 +87,7 @@ jobs:
             fi
           fi
 
-          # 2) 若失败，使用 Python 脚本（输出错误信息）
+          # 2) 若失败，使用 Python 脚本
           if [ ! -s /tmp/outbound.json ]; then
             echo "尝试 Python 解析..."
             if python3 parse_node.py 2> /tmp/parse_error.log > /tmp/outbound.json; then
@@ -128,6 +128,7 @@ jobs:
           fi
 
           echo "📝 生成 sing-box 配置..."
+          # /tmp/outbound.json 已经是数组格式（由 parse_node.py 或 sing-box convert 保证）
           echo '{"inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":1080,"tag":"socks-in"}],"outbounds":' > sing-box-config.json
           cat /tmp/outbound.json >> sing-box-config.json
           echo '}' >> sing-box-config.json
