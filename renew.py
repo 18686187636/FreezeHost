@@ -35,12 +35,10 @@ def _register_sensitive(*values):
         if v and len(v) > 2:
             _SENSITIVE_VALUES.add(v)
 
-
 def _server_label(server_id: str) -> str:
     if server_id not in _SERVER_INDEX:
         _SERVER_INDEX[server_id] = len(_SERVER_INDEX) + 1
     return f"服务器#{_SERVER_INDEX[server_id]}"
-
 
 def _mask(text: str) -> str:
     if DISCORD_TOKEN:
@@ -59,31 +57,34 @@ def _mask(text: str) -> str:
     text = re.sub(r"connect\.sid=[^;\s]+", "connect.sid=***", text)
     return text
 
-
 def log_info(msg: str):  print(f"[INFO] {_mask(msg)}")
 def log_warn(msg: str):  print(f"[WARN] {_mask(msg)}")
 def log_error(msg: str): print(f"[ERROR] {_mask(msg)}")
 
 def parse_remaining(text: str) -> str | None:
+    """将剩余时间文本（如 '1.5 days and 2.3 hours'）解析为 'X天X时X分' 格式"""
     if not text:
         return None
+    # 匹配数字（带小数）
     d = re.search(r"(\d+(?:\.\d+)?)\s*day", text, re.I)
     h = re.search(r"(\d+(?:\.\d+)?)\s*hour", text, re.I)
     days_raw  = float(d.group(1)) if d else 0.0
     hours_raw = float(h.group(1)) if h else 0.0
-    extra_hours = (days_raw - int(days_raw)) * 24
-    total_hours = hours_raw + extra_hours
-    final_days  = int(days_raw)
-    final_hours = int(total_hours)
-    final_mins  = int(round((total_hours - final_hours) * 60))
+    # 统一按小时计算
+    total_hours = days_raw * 24 + hours_raw
+    if total_hours <= 0:
+        return None
+    final_days = int(total_hours // 24)
+    remaining_hours = total_hours % 24
+    final_hours = int(remaining_hours)
+    final_mins = int(round((remaining_hours - final_hours) * 60))
     parts = []
     if final_days > 0:
         parts.append(f"{final_days}天")
     if final_hours > 0 or final_days > 0:
         parts.append(f"{final_hours}时")
     parts.append(f"{final_mins}分")
-    return "".join(parts) if parts else None
-
+    return "".join(parts)
 
 def remaining_total_days(text: str) -> float | None:
     if not text:
@@ -172,7 +173,6 @@ def take_screenshot(page, name: str) -> bytes | None:
         log_warn(f"截图失败: {e}")
         return None
 
-
 def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
     if not buffers:
         return None
@@ -210,10 +210,19 @@ def check_site_down(page) -> bool:
     except Exception:
         return False
 
+def check_site_blocked(page) -> bool:
+    """检测是否因代理/VPN被阻止"""
+    try:
+        body = page.content()
+        if "VPN" in body or "代理" in body or "proxy" in body.lower():
+            if "阻止" in body or "block" in body.lower() or "access denied" in body.lower():
+                return True
+        return False
+    except:
+        return False
 
 def wait_for_site_ready(page) -> bool:
-    """Try loading FreezeHost up to MAX_SITE_RETRIES times, handling outage screens.
-    Returns True if site became available, False if still down after all retries."""
+    """尝试加载 FreezeHost，直到登录按钮可见或达到最大重试次数"""
     for attempt in range(1, MAX_SITE_RETRIES + 1):
         log_info(f"加载 FreezeHost 首页 (尝试 {attempt}/{MAX_SITE_RETRIES})...")
         try:
@@ -226,11 +235,16 @@ def wait_for_site_ready(page) -> bool:
 
         page.wait_for_timeout(3000)
 
+        # 检查是否因代理被阻止
+        if check_site_blocked(page):
+            log_error("检测到页面提示 VPN/代理被阻止，无法继续")
+            take_screenshot(page, f"site-blocked-{attempt}")
+            return False
+
+        # 检测是否宕机页面
         if check_site_down(page):
             log_warn(f"FreezeHost 后端服务不可用 (尝试 {attempt})")
             take_screenshot(page, f"site-down-{attempt}")
-
-            # Try clicking the "Retry Now" button on the page itself
             try:
                 retry_btn = page.locator('button:has-text("Retry Now")')
                 if retry_btn.is_visible():
@@ -238,31 +252,34 @@ def wait_for_site_ready(page) -> bool:
                     retry_btn.click()
                     page.wait_for_timeout(10_000)
                     if not check_site_down(page):
-                        log_info("站点恢复正常")
-                        return True
+                        log_info("站点恢复正常，继续检测登录按钮")
+                    else:
+                        if attempt < MAX_SITE_RETRIES:
+                            page.wait_for_timeout(RETRY_WAIT)
+                        continue
+                else:
+                    if attempt < MAX_SITE_RETRIES:
+                        page.wait_for_timeout(RETRY_WAIT)
+                    continue
             except Exception:
-                pass
+                if attempt < MAX_SITE_RETRIES:
+                    page.wait_for_timeout(RETRY_WAIT)
+                continue
 
+        # 确认登录按钮可见（关键修复）
+        try:
+            login_btn = page.locator('span.text-lg:has-text("Login with Discord")')
+            login_btn.wait_for(state="visible", timeout=10000)
+            log_info("首页加载正常，登录按钮可见")
+            return True
+        except PlaywrightTimeout:
+            log_warn("登录按钮未出现，可能页面结构变化或网络延迟")
+            take_screenshot(page, f"no-login-btn-{attempt}")
             if attempt < MAX_SITE_RETRIES:
-                log_info(f"等待 {RETRY_WAIT // 1000} 秒后重试...")
                 page.wait_for_timeout(RETRY_WAIT)
             continue
 
-        # Check if the login button is present
-        try:
-            login_visible = page.locator('span.text-lg:has-text("Login with Discord")').is_visible()
-            if login_visible:
-                log_info("首页加载正常，登录按钮可见")
-                return True
-        except Exception:
-            pass
-
-        # Page loaded but no login button and not the known error page — might be OK
-        log_info("首页已加载（未检测到宕机页面）")
-        return True
-
     return False
-
 
 def handle_oauth_page(page):
     log_info("进入 OAuth 授权页处理")
@@ -271,17 +288,7 @@ def handle_oauth_page(page):
     for _ in range(20):
         if "discord.com" not in page.url:
             return
-        btn_text = ""
-        try:
-            for sel in ['button[type="submit"]', 'div[class*="footer"] button', 'button[class*="primary"]']:
-                btn = page.locator(sel).last
-                if btn.is_visible():
-                    btn_text = btn.inner_text().strip().lower()
-                    break
-        except Exception:
-            pass
-        if "authorize" in btn_text and "scroll" not in btn_text:
-            break
+        # 尝试滚动到底部，使授权按钮可见
         page.evaluate("""() => {
             const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
                 '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
@@ -305,36 +312,30 @@ def handle_oauth_page(page):
         }""")
         page.wait_for_timeout(800)
 
-    for _ in range(10):
-        if "discord.com" not in page.url:
-            return
-        for sel in ['button:has-text("Authorize")','button:has-text("授权")',
-                    'button[type="submit"]','div[class*="footer"] button','button[class*="primary"]']:
-            try:
-                btn = page.locator(sel).last
-                if not btn.is_visible():
-                    continue
-                text = btn.inner_text().strip()
-                if any(k in text.lower() for k in ("取消","cancel","deny")):
-                    continue
-                if "scroll" in text.lower():
-                    page.evaluate("""() => {
-                        document.querySelectorAll('div').forEach(el => {
-                            if (el.scrollHeight > el.clientHeight + 5) el.scrollTop = el.scrollHeight;
-                        }); scrollTo(0, document.body.scrollHeight);
-                    }""")
-                    page.wait_for_timeout(1000)
-                    break
-                if btn.is_disabled():
-                    page.wait_for_timeout(1000)
-                    break
+        # 尝试点击授权按钮（等待启用）
+        try:
+            # 优先使用 enabled 状态
+            auth_btn = page.locator('button:has-text("Authorize"):enabled, button:has-text("授权"):enabled')
+            if auth_btn.is_visible():
+                auth_btn.click()
+                page.wait_for_timeout(2000)
+                if "discord.com" not in page.url:
+                    return
+                continue
+        except:
+            pass
+
+        # 备选：点击最底部的按钮
+        try:
+            btn = page.locator('div[class*="footer"] button').last
+            if btn.is_visible() and btn.is_enabled():
                 btn.click()
                 page.wait_for_timeout(2000)
                 if "discord.com" not in page.url:
                     return
-                break
-            except Exception:
-                continue
+        except:
+            pass
+
         page.wait_for_timeout(1500)
 
 def discover_server_ids(page) -> list[str]:
@@ -388,7 +389,7 @@ def process_server(page, server_id: str) -> dict:
     tag = _server_label(server_id)
     server_url = f"{BASE_URL}/server-console?id={server_id}"
     result = dict(server_id=server_id, status="unknown", before=None, after=None,
-                  emoji="❓", status_label="未知", detail="")
+                  emoji="❓", status_label="未知", detail="", remaining_days=None)
 
     log_info(f"[{server_id}] 开始处理")
     try:
@@ -404,6 +405,7 @@ def process_server(page, server_id: str) -> dict:
         remaining_before = parse_remaining(status_text)
         total_days = remaining_total_days(status_text)
         result["before"] = remaining_before
+        result["remaining_days"] = total_days
 
         if total_days is not None and total_days > 7:
             log_info(f"[{server_id}] 剩余 {total_days:.1f} 天，无需续期")
@@ -449,12 +451,6 @@ def process_server(page, server_id: str) -> dict:
         btn_text = renew_href.get("text", "")
         href = renew_href["href"]
 
-        if btn_text and "renew instance" not in btn_text.lower():
-            if not (total_days is not None and total_days <= 7):
-                result.update(status="tooearly", emoji="⏳", status_label="冷却期",
-                              detail=remaining_before or btn_text)
-                return result
-
         # ── 执行续期 ─────────────────────────────────────
         page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
         try:
@@ -473,6 +469,10 @@ def process_server(page, server_id: str) -> dict:
                     return el ? el.innerText.trim() : null;
                 }""")
                 result["after"] = parse_remaining(after_text)
+                # 更新剩余天数
+                new_days = remaining_total_days(after_text)
+                if new_days is not None:
+                    result["remaining_days"] = new_days
             except Exception:
                 pass
             result.update(status="renewed", emoji="✅", status_label="续期成功",
@@ -498,8 +498,7 @@ def run():
     if not DISCORD_TOKEN:
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
 
-    log_info("启动浏览器 (WARP 系统级代理)")
-
+    log_info("启动浏览器 (直连，不使用代理)")
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": VIEWPORT_W, "height": VIEWPORT_H})
@@ -507,6 +506,8 @@ def run():
         log_info("浏览器就绪")
 
         display_name = "未知用户"
+        all_results = []
+        final_screenshots = []
 
         try:
             # ── 出口 IP ───────────────────────────────────
@@ -521,20 +522,39 @@ def run():
             # ── 检测站点可用性（带重试） ─────────────────
             log_info("打开 FreezeHost 登录页")
             if not wait_for_site_ready(page):
-                buf = take_screenshot(page, "site-down-final")
+                buf = take_screenshot(page, "site-unavailable")
                 msg = (
                     f"用户：{display_name}\n"
-                    f"🔌 FreezeHost 站点宕机\n"
-                    f"CONNECTION TO THE MANAGEMENT SERVICES LOST\n"
-                    f"已重试 {MAX_SITE_RETRIES} 次仍无法连接\n\n"
+                    f"🔌 FreezeHost 站点不可用\n"
+                    f"可能原因：代理被屏蔽、服务宕机、登录按钮未出现\n"
+                    f"已重试 {MAX_SITE_RETRIES} 次\n\n"
                     f"FreezeHost Auto Renew"
                 )
                 send_tg(msg, buf)
-                log_warn("站点宕机，本次跳过续期")
+                log_warn("站点不可用，本次跳过续期")
                 return   # Exit gracefully — not a script error
 
             # ── 登录 ─────────────────────────────────────
-            page.click('span.text-lg:has-text("Login with Discord")', timeout=15_000)
+            # 使用备用选择器提高兼容性
+            login_selectors = [
+                'span.text-lg:has-text("Login with Discord")',
+                'button:has-text("Login with Discord")',
+                'a:has-text("Login with Discord")',
+                'div[class*="login"] button',
+            ]
+            clicked = False
+            for sel in login_selectors:
+                try:
+                    btn = page.locator(sel)
+                    if btn.is_visible():
+                        btn.click(timeout=15000)
+                        clicked = True
+                        log_info(f"点击登录按钮（选择器: {sel}）")
+                        break
+                except:
+                    continue
+            if not clicked:
+                raise RuntimeError("未找到任何可点击的登录按钮")
 
             confirm_btn = page.locator("button#confirm-login")
             confirm_btn.wait_for(state="visible")
@@ -608,30 +628,42 @@ def run():
                 return
 
             # ── 逐台处理 ─────────────────────────────────
-            results, screenshots = [], []
             for sid in server_ids:
                 log_info("=" * 50)
                 res = process_server(page, sid)
-                results.append(res)
+                all_results.append(res)
                 buf = take_screenshot(page, f"server-{_SERVER_INDEX.get(sid, 0)}")
                 if buf:
-                    screenshots.append(buf)
+                    final_screenshots.append(buf)
 
             # ── 合并截图 ─────────────────────────────────
-            final_img = (screenshots[0] if len(screenshots) == 1
-                         else merge_screenshots(browser, screenshots) if screenshots
+            final_img = (final_screenshots[0] if len(final_screenshots) == 1
+                         else merge_screenshots(browser, final_screenshots) if final_screenshots
                          else None)
 
-            # ── TG 推送（完整信息） ──────────────────────
+            # ── 构造推送消息 ──────────────────────────────
             lines = []
-            for r in results:
+            min_days = None
+            for r in all_results:
                 s = f"服务器: {r['server_id']} | {r['emoji']}{r['status_label']}"
                 if r["detail"]:
                     s += f" {r['detail']}"
                 lines.append(s)
+                # 收集剩余天数（取最小值）
+                if r.get("remaining_days") is not None:
+                    if min_days is None or r["remaining_days"] < min_days:
+                        min_days = r["remaining_days"]
 
             send_tg("\n".join([f"用户：{display_name}", *lines, "", "FreezeHost Auto Renew"]), final_img)
-            log_info("所有服务器处理完毕")
+
+            # ── 写入 JSON 供 Workflow 使用 ──────────────
+            with open("renew_result.json", "w") as f:
+                json.dump({
+                    "min_remaining_days": min_days,
+                    "servers": all_results,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }, f, indent=2)
+            log_info(f"结果已写入 renew_result.json，最小剩余天数: {min_days}")
 
         except Exception as e:
             buf = take_screenshot(page, "fatal-error")
@@ -639,7 +671,6 @@ def run():
             raise
         finally:
             browser.close()
-
 
 if __name__ == "__main__":
     try:
