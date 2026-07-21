@@ -44,7 +44,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq bc net-tools curl
 
-      - name: 配置代理（使用 sing-box + parse_node.py）
+      - name: 配置代理（sing-box + parse_node.py）
         id: setup_proxy
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
@@ -77,34 +77,48 @@ jobs:
           rm -rf sing-box.tar.gz "$SING_BOX_DIR"
           sing-box version
 
-          echo "📝 使用 parse_node.py 解析节点..."
+          echo "📝 解析节点链接..."
           export VLESS="${NODE_LINK}"
-          # 尝试 sing-box convert 直接转换
+
+          # 1) 尝试 sing-box 原生转换
           if echo "$VLESS" | sing-box convert link - > /tmp/outbound.json 2>/dev/null; then
             if [ -s /tmp/outbound.json ]; then
               echo "✅ sing-box 原生转换成功"
             fi
           fi
 
-          # 如果失败，使用 Python 脚本
+          # 2) 若失败，使用 Python 脚本（输出错误信息）
           if [ ! -s /tmp/outbound.json ]; then
-            if python3 parse_node.py > /tmp/outbound.json 2>/dev/null; then
-              echo "✅ Python 解析成功"
+            echo "尝试 Python 解析..."
+            if python3 parse_node.py 2> /tmp/parse_error.log > /tmp/outbound.json; then
+              if [ -s /tmp/outbound.json ]; then
+                echo "✅ Python 解析成功"
+              else
+                echo "⚠️ Python 解析生成空文件"
+                cat /tmp/parse_error.log
+              fi
+            else
+              echo "❌ Python 解析失败"
+              cat /tmp/parse_error.log
             fi
           fi
 
-          # 如果仍然没有，尝试作为订阅
+          # 3) 如果仍失败且链接是 http/https，作为订阅下载
           if [ ! -s /tmp/outbound.json ]; then
-            echo "⚠️ 尝试作为订阅下载..."
-            curl -L -o /tmp/sub.txt "$VLESS" --connect-timeout 10 --max-time 30 || true
-            FIRST_LINE=$(grep -v '^$' /tmp/sub.txt | head -n1)
-            if [ -n "$FIRST_LINE" ]; then
-              export VLESS="$FIRST_LINE"
-              if echo "$VLESS" | sing-box convert link - > /tmp/outbound.json 2>/dev/null; then
-                if [ -s /tmp/outbound.json ]; then
-                  echo "✅ 订阅转换成功"
+            if [[ "$VLESS" =~ ^https?:// ]]; then
+              echo "⚠️ 尝试作为订阅下载..."
+              curl -L -o /tmp/sub.txt "$VLESS" --connect-timeout 10 --max-time 30 || true
+              FIRST_LINE=$(grep -v '^$' /tmp/sub.txt | head -n1)
+              if [ -n "$FIRST_LINE" ]; then
+                export VLESS="$FIRST_LINE"
+                if echo "$VLESS" | sing-box convert link - > /tmp/outbound.json 2>/dev/null; then
+                  if [ -s /tmp/outbound.json ]; then
+                    echo "✅ 订阅转换成功"
+                  fi
                 fi
               fi
+            else
+              echo "ℹ️ 链接不是 http/https，跳过订阅尝试"
             fi
           fi
 
@@ -122,10 +136,10 @@ jobs:
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
           sleep 5
           if netstat -tuln | grep -q ':1080'; then
-            echo "✅ 代理已启动"
+            echo "✅ 代理已启动（127.0.0.1:1080）"
             echo "PROXY_URL=socks5://127.0.0.1:1080" >> $GITHUB_ENV
           else
-            echo "❌ 代理启动失败"
+            echo "❌ 代理启动失败，查看日志："
             cat sing-box.log
             exit 1
           fi
@@ -178,7 +192,7 @@ jobs:
         if: success() && steps.extract_days.outputs.remaining_days != ''
         run: |
           cd workflow_repo
-          NEW_CRON="0 0 * * *"   # 实际可根据 remaining_days 计算
+          NEW_CRON="0 0 * * *"   # 可根据 remaining_days 计算
           sed -i "s/- cron: .*/- cron: '$NEW_CRON'/" .github/workflows/FreezeHost_Renew.yml
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
