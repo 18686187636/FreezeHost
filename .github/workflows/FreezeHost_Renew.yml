@@ -44,7 +44,60 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq bc net-tools
 
-      # 这里仅做示例，实际代理设置先跳过，直接运行续期脚本（直连）
+      - name: 设置代理（基于 NODE_LINK）
+        id: setup_proxy
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -z "$NODE_LINK" ]; then
+            echo "未配置 NODE_LINK，跳过代理设置"
+            exit 0
+          fi
+
+          echo "➜ 下载 sing-box..."
+          curl -L -o /tmp/sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.tar.gz
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo mv /tmp/sing-box-*/sing-box /usr/local/bin/
+          chmod +x /usr/local/bin/sing-box
+
+          echo "➜ 解析节点链接..."
+          echo "$NODE_LINK" | /usr/local/bin/sing-box convert link - > /tmp/outbound.json || true
+
+          if [ ! -s /tmp/outbound.json ]; then
+            # 尝试作为订阅
+            curl -L "$NODE_LINK" -o /tmp/sub.txt
+            FIRST_LINE=$(grep -v '^$' /tmp/sub.txt | head -n1)
+            if [ -z "$FIRST_LINE" ]; then
+              echo "❌ 无法解析节点链接或订阅"
+              exit 1
+            fi
+            echo "$FIRST_LINE" | /usr/local/bin/sing-box convert link - > /tmp/outbound.json
+          fi
+
+          if [ ! -s /tmp/outbound.json ]; then
+            echo "❌ 转换失败"
+            exit 1
+          fi
+
+          echo "➜ 生成 config.json..."
+          # 使用 echo 和 cat 构建 JSON，完全避免 heredoc
+          echo '{"inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":1080,"tag":"socks-in"}],"outbounds":' > config.json
+          cat /tmp/outbound.json >> config.json
+          echo '}' >> config.json
+
+          echo "➜ 启动 sing-box..."
+          /usr/local/bin/sing-box run -c config.json &
+          for i in {1..10}; do
+            if netstat -tulpn 2>/dev/null | grep -q ":1080.*LISTEN"; then
+              echo "✅ 代理已启动"
+              echo "PROXY_URL=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "❌ 代理启动超时"
+          exit 1
+
       - name: 设置 Discord Token
         run: |
           TOKEN_NUM="${{ steps.select_token.outputs.token_number }}"
@@ -56,15 +109,16 @@ jobs:
             5) echo "DISCORD_TOKEN=${{ secrets.FREEZEHOST_DISCORD_TOKEN_5 }}" >> "$GITHUB_ENV" ;;
           esac
 
-      - name: 运行续期（直连，无代理）
+      - name: 运行续期
         env:
           FREEZEHOST_DISCORD_TOKEN: ${{ env.DISCORD_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_URL: ${{ env.PROXY_URL }}
         run: |
           python renew.py 2>&1 | tee renew.log
 
-      - name: 提取剩余天数（简版）
+      - name: 提取剩余天数
         id: extract_days
         if: always()
         run: |
@@ -73,14 +127,16 @@ jobs:
             MIN_DAYS=$(jq -r '.min_remaining_days // empty' renew_result.json)
           fi
           if [ -z "$MIN_DAYS" ] && [ -f "renew.log" ]; then
-            MIN_DAYS=$(grep -oP '剩余\s*[\d.]+' renew.log | grep -oP '[\d.]+' | sort -n | head -1 || echo "0.5")
+            MIN_DAYS=$(grep -oP '剩余\s*[\d.]+' renew.log | grep -oP '[\d.]+' | sort -n | head -1 || echo "")
           fi
-          if [ -z "$MIN_DAYS" ]; then MIN_DAYS="0.5"; fi
+          if [ -z "$MIN_DAYS" ] || [ "$MIN_DAYS" = "0" ]; then
+            MIN_DAYS="0.5"
+          fi
           echo "remaining_days=$MIN_DAYS" >> "$GITHUB_OUTPUT"
           echo "剩余天数: $MIN_DAYS"
 
-      - name: 更新 Cron（占位）
-        if: success()
+      - name: 更新 Cron（如果成功）
+        if: success() && steps.extract_days.outputs.remaining_days != ''
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}
@@ -88,16 +144,32 @@ jobs:
           path: workflow_repo
           fetch-depth: 1
 
-      - name: 修改 Cron（简化）
-        if: success()
+      - name: 修改 Cron 时间
+        if: success() && steps.extract_days.outputs.remaining_days != ''
         run: |
           cd workflow_repo
-          NEW_CRON="0 0 * * *"   # 临时
-          sed -i "s/- cron: .*/- cron: '$NEW_CRON'/" .github/workflows/FreezeHost_Renew.yml
+          REMAINING_DAYS="${{ steps.extract_days.outputs.remaining_days }}"
+          TOKEN_NUM="${{ steps.select_token.outputs.token_number }}"
+          # 简单计算下次运行时间（示例：当前时间+1天，实际可根据剩余天数调整）
+          NEXT_DATE=$(date -u -d "+1 day" +"%Y-%m-%d %H:%M")
+          NEXT_DAY=$(date -u -d "+1 day" +"%-d")
+          NEXT_MONTH=$(date -u -d "+1 day" +"%-m")
+          NEXT_HOUR=$(date -u -d "+1 day" +"%-H")
+          NEXT_MINUTE=$(date -u -d "+1 day" +"%-M")
+          NEW_CRON="$NEXT_MINUTE $NEXT_HOUR $NEXT_DAY $NEXT_MONTH *"
+          WORKFLOW_FILE=".github/workflows/FreezeHost_Renew.yml"
+          # 查找 Token 对应的行（根据注释）
+          LINE_NUM=$(grep -n "FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM" "$WORKFLOW_FILE" | cut -d: -f1 | head -n1 || echo "")
+          if [ -n "$LINE_NUM" ]; then
+            sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'   # FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM" "$WORKFLOW_FILE"
+          else
+            # 如果没有匹配，添加新的 cron 行（简单追加）
+            echo "    - cron: '$NEW_CRON'   # FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM" >> "$WORKFLOW_FILE"
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .github/workflows/FreezeHost_Renew.yml
-          git commit -m "更新 Cron" || exit 0
+          git add "$WORKFLOW_FILE"
+          git commit -m "更新 Cron for Token $TOKEN_NUM" || exit 0
           git remote set-url origin "https://x-access-token:${{ secrets.REPO_TOKEN }}@github.com/${{ github.repository }}.git"
           git push || exit 0
 
