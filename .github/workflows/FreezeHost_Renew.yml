@@ -128,7 +128,6 @@ jobs:
           fi
 
           echo "📝 生成 sing-box 配置..."
-          # /tmp/outbound.json 已经是数组格式（由 parse_node.py 或 sing-box convert 保证）
           echo '{"inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":1080,"tag":"socks-in"}],"outbounds":' > sing-box-config.json
           cat /tmp/outbound.json >> sing-box-config.json
           echo '}' >> sing-box-config.json
@@ -136,13 +135,23 @@ jobs:
           echo "🚀 启动 sing-box..."
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
           sleep 5
-          if netstat -tuln | grep -q ':1080'; then
-            echo "✅ 代理已启动（127.0.0.1:1080）"
-            echo "PROXY_URL=socks5://127.0.0.1:1080" >> $GITHUB_ENV
-          else
+
+          # 检查端口监听
+          if ! netstat -tuln | grep -q ':1080'; then
             echo "❌ 代理启动失败，查看日志："
             cat sing-box.log
             exit 1
+          fi
+
+          echo "🔍 测试代理连通性（访问 api.ipify.org）..."
+          if curl --socks5 127.0.0.1:1080 -s -o /dev/null -w "%{http_code}" https://api.ipify.org --max-time 10 | grep -q "200"; then
+            echo "✅ 代理连通正常"
+            echo "PROXY_URL=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+          else
+            echo "⚠️ 代理连通性测试失败，节点可能不可用，将使用直连"
+            # 关闭代理进程
+            pkill -f sing-box || true
+            # 不设置 PROXY_URL，后面使用直连
           fi
 
       - name: 设置 Discord Token
@@ -194,7 +203,7 @@ jobs:
         run: |
           cd workflow_repo
           NEW_CRON="0 0 * * *"   # 可根据 remaining_days 计算
-          sed -i "s/- cron: '0 0 * * *'
+          sed -i "s/- cron: .*/- cron: '$NEW_CRON'/" .github/workflows/FreezeHost_Renew.yml
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .github/workflows/FreezeHost_Renew.yml
