@@ -46,13 +46,16 @@ jobs:
 
       - name: 配置代理（sing-box 解析 NODE_LINK）
         id: setup_proxy
-        if: env.NODE_LINK != ''
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
+          if [ -z "$NODE_LINK" ]; then
+            echo "未配置 NODE_LINK，跳过代理"
+            exit 0
+          fi
           set -e
+
           echo "⬇️ 下载 sing-box 二进制..."
-          # 获取最新版本下载链接（过滤 alpha/beta/rc）
           LATEST_URL=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | \
             grep -o '"browser_download_url": "[^"]*linux-amd64[^"]*"' | \
             grep -v 'alpha\|beta\|rc' | head -1 | sed 's/"browser_download_url": "//' | sed 's/"//')
@@ -75,111 +78,21 @@ jobs:
           rm -rf sing-box.tar.gz "$SING_BOX_DIR"
           sing-box version
 
-          echo "📝 解析节点链接并生成配置文件..."
-          # 清理链接（移除空白字符）
+          echo "📝 使用 sing-box 原生转换解析节点..."
           VLESS=$(echo "${NODE_LINK}" | tr -d ' \n\r\t')
-          export VLESS
-          # 检查是否 vless 协议（可根据需要扩展支持 vmess/trojan）
-          if [[ ! "$VLESS" =~ ^vless:// ]]; then
-            echo "⚠️ 当前仅支持 vless:// 协议，尝试直接作为订阅链接转换..."
-            # 尝试使用 sing-box convert 转换（支持大部分标准链接）
-            if echo "$VLESS" | /usr/local/bin/sing-box convert link - > /tmp/outbound.json 2>/dev/null; then
-              if [ -s /tmp/outbound.json ]; then
-                echo "✅ sing-box 原生转换成功"
-                # 构建完整配置
-                echo '{"inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":1080,"tag":"socks-in"}],"outbounds":' > sing-box-config.json
-                cat /tmp/outbound.json >> sing-box-config.json
-                echo '}' >> sing-box-config.json
-                cat sing-box-config.json
-              else
-                echo "❌ 转换失败"
-                exit 1
-              fi
-            else
-              echo "❌ 不支持的链接格式，请使用 vless://"
-              exit 1
-            fi
-          else
-            # 使用 Python 解析 vless 链接（参考 Bot-hosting 方案）
-            python3 << 'PYEOF'
-            import json, sys, os, re
-            from urllib.parse import urlparse, parse_qs
-
-            link = os.environ.get('VLESS', '')
-            if not link:
-                sys.exit(1)
-
-            parsed = urlparse(link)
-            if parsed.scheme != 'vless':
-                sys.exit(1)
-
-            netloc = parsed.netloc
-            if '@' in netloc:
-                uuid, host_port = netloc.split('@', 1)
-            else:
-                uuid, host_port = '', netloc
-
-            host = ''
-            port = '443'
-            bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
-            if bracket_match:
-                host = bracket_match.group(1)
-                if bracket_match.group(2):
-                    port = bracket_match.group(2)
-            else:
-                if host_port.count(':') > 1:
-                    host = host_port
-                else:
-                    if ':' in host_port:
-                        host, port = host_port.split(':', 1)
-                    else:
-                        host = host_port
-
-            if not host:
-                print(f"❌ 无法解析主机地址: {host_port}", file=sys.stderr)
-                sys.exit(1)
-
-            params = parse_qs(parsed.query)
-            sni = params.get('sni', [''])[0] or host
-            fp = params.get('fp', [''])[0] or 'chrome'
-            flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
-            type_ = params.get('type', ['tcp'])[0]
-            security = params.get('security', [''])[0]
-
-            outbound = {
-                "type": "vless",
-                "tag": "vless-out",
-                "server": host,
-                "server_port": int(port),
-                "uuid": uuid,
-                "flow": flow,
-                "tls": {
-                    "enabled": True,
-                    "server_name": sni,
-                    "insecure": False,
-                    "utls": {"enabled": True, "fingerprint": fp}
-                },
-                "packet_encoding": "packetaddr"
-            }
-            if type_ != 'tcp':
-                outbound["transport"] = {"type": type_}
-            if security == 'reality':
-                pbk = params.get('pbk', [''])[0]
-                sid = params.get('sid', [''])[0]
-                outbound['tls']['reality'] = {"enabled": True, "public_key": pbk, "short_id": sid}
-
-            config = {
-                "log": {"level": "warn"},
-                "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080}],
-                "outbounds": [outbound],
-                "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
-            }
-            with open("sing-box-config.json", "w") as f:
-                json.dump(config, f, indent=2)
-            print("✅ vless 配置已生成")
-            PYEOF
-            [ -f sing-box-config.json ] || { echo "❌ Python 解析失败"; exit 1; }
+          if ! echo "$VLESS" | /usr/local/bin/sing-box convert link - > /tmp/outbound.json 2>/dev/null; then
+            echo "❌ 转换失败，请检查节点链接格式"
+            exit 1
           fi
+          if [ ! -s /tmp/outbound.json ]; then
+            echo "❌ 转换结果为空"
+            exit 1
+          fi
+
+          echo "📝 生成完整 sing-box 配置..."
+          echo '{"inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":1080,"tag":"socks-in"}],"outbounds":' > sing-box-config.json
+          cat /tmp/outbound.json >> sing-box-config.json
+          echo '}' >> sing-box-config.json
 
           echo "🚀 启动 sing-box..."
           nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
@@ -228,7 +141,7 @@ jobs:
           echo "remaining_days=$MIN_DAYS" >> "$GITHUB_OUTPUT"
           echo "剩余天数: $MIN_DAYS"
 
-      - name: 更新 Cron（简版，可按需完善）
+      - name: 更新 Cron（简版）
         if: success() && steps.extract_days.outputs.remaining_days != ''
         uses: actions/checkout@v4
         with:
@@ -237,7 +150,7 @@ jobs:
           path: workflow_repo
           fetch-depth: 1
 
-      - name: 修改 Cron
+      - name: 修改 Cron（占位）
         if: success() && steps.extract_days.outputs.remaining_days != ''
         run: |
           cd workflow_repo
